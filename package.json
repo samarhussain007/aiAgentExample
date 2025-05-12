@@ -26,14 +26,14 @@
   "scripts": {
     "build": "tsc",
     "start": "node ./dist/app.js",
-    "dev": "tsx watch ./server/src/app.ts",
-    "dev:watch": "nodemon --watch './server/src/**/*.ts' --exec 'ts-node --esm' ./server/src/app.ts"
+    "dev": "tsx watch ./src/app.ts",
+    "dev:watch": "nodemon --watch './src/**/*.ts' --exec 'ts-node --esm' ./src/app.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.40.1",
     "@langchain/anthropic": "^0.3.20",
     "@langchain/community": "^0.3.42",
-    "@langchain/core": "^0.3.51",
+    "@langchain/core": "^0.3.55",
     "@langchain/deepseek": "^0.0.1",
     "@langchain/google-genai": "^0.2.5",
     "@langchain/ollama": "^0.2.0",
