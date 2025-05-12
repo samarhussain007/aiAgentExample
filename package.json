@@ -36,6 +36,7 @@
     "@langchain/core": "^0.3.55",
     "@langchain/deepseek": "^0.0.1",
     "@langchain/google-genai": "^0.2.5",
+    "@langchain/langgraph": "^0.2.71",
     "@langchain/ollama": "^0.2.0",
     "@types/node": "^18.14.6",
     "cheerio": "^1.0.0",
