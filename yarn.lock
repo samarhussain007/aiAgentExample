@@ -256,10 +256,10 @@
     "@langchain/openai" "^0.4.2"
     zod "^3.24.1"
 
-"@langchain/google-genai@^0.2.5":
-  version "0.2.5"
-  resolved "https://registry.yarnpkg.com/@langchain/google-genai/-/google-genai-0.2.5.tgz#677baf14019e70f916445785c71438bd75444bdc"
-  integrity sha512-F+jzFqI4zgLwH69nDLKg0G1OUbRzp8apR3mwJeT1VAxI4CC/ih8nQJ6qqvR4GNurkZKXWFq6T/TVP9v+2vl5FQ==
+"@langchain/google-genai@^0.2.9":
+  version "0.2.9"
+  resolved "https://registry.yarnpkg.com/@langchain/google-genai/-/google-genai-0.2.9.tgz#22f4517372949d0bb7f4e18ecb3a622d779e4431"
+  integrity sha512-AcHAD0VX8Qci5ApLYd6ojMTJUk4ZTeMQrsOYsOVv09sy3FtrLHkRxZXkb0qgtDS9EJ+w40904B+s6s2H9+HZmQ==
   dependencies:
     "@google/generative-ai" "^0.24.0"
     uuid "^11.1.0"

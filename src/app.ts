@@ -12,11 +12,16 @@ import {
   ToolMessage,
 } from "@langchain/core/messages";
 import { tool } from "@langchain/core/tools";
-import { MessagesAnnotation, StateGraph } from "@langchain/langgraph";
+import {
+  MemorySaver,
+  MessagesAnnotation,
+  StateGraph,
+} from "@langchain/langgraph";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { z } from "zod";
 
 import { BaseMessage, isAIMessage } from "@langchain/core/messages";
+import { threadId } from "worker_threads";
 
 const model = new ChatOllama({
   model: "mistral",
@@ -72,6 +77,8 @@ async function queryOrRespond(state: typeof MessagesAnnotation.State) {
   //This just provides the intent to the llm, saying that if you need to retrieve something you can call retrieve tool
   const llmWithTools = model.bindTools([retrieve]);
   const response = await llmWithTools.invoke(state.messages);
+
+  console.log("HERE I KNOW WHATS HAPPENING ", state.messages);
   //MessageState appends messages to state instead of overwritting
   return { messages: [response] };
 }
@@ -109,9 +116,8 @@ const generate = async (state: typeof MessagesAnnotation.State) => {
     (message) =>
       message instanceof HumanMessage ||
       message instanceof SystemMessage ||
-      (message instanceof AIMessage &&
-        message.tool_calls &&
-        message.tool_calls.length === 0)
+      message instanceof ToolMessage ||
+      message instanceof AIMessage
   );
 
   const prompt = [
@@ -137,7 +143,14 @@ const graphBuilder = new StateGraph(MessagesAnnotation)
   .addEdge("tools", "generate")
   .addEdge("generate", "__end__");
 
-const graph = graphBuilder.compile();
+const checkpointer = new MemorySaver();
+const graphWithMemory = graphBuilder.compile({ checkpointer });
+
+// Specify an ID for the thread
+const threadConfig = {
+  configurable: { thread_id: "abc123" },
+  streamMode: "values" as const,
+};
 
 const prettyPrint = (message: BaseMessage) => {
   let txt = `[${message.getType()}]: ${message.content}`;
@@ -162,20 +175,31 @@ let inputs1 = {
 let inputs2 = {
   messages: [
     new SystemMessage(`
-You are a helpful assistant. You are allowed to use the \`retrieve\` tool **only if**:
-- The user question includes factual or technical keywords like "difference", "how", "architecture", or "explain"
-- The message is longer than 5 words
-- You are confident you cannot answer it directly
+You are a helpful assistant. When the user asks a technical question, respond by calling the \`retrieve\` tool using the structured tool call system, not as plain text.
 
-If the message is a greeting, or a short generic question (like "What is X?"), do not use any tools. Respond directly and concisely.
+Example tool call (do this, not just write it):
+retrieve({ "query": "Common methods of self-reflection in autonomous agents" })
+
+Do not describe the tool. Just invoke it when needed.
 `),
 
     new HumanMessage("How does the Self-Reflective agent architecture work?"),
   ],
 };
-for await (const step of await graph.stream(inputs2, {
-  streamMode: "values",
-})) {
+
+let inputs4 = {
+  messages: [
+    { role: "user", content: "Can you look up some common ways of doing it?" },
+  ],
+};
+
+for await (const step of await graphWithMemory.stream(inputs2, threadConfig)) {
+  const lastMessage = step.messages[step.messages.length - 1];
+  prettyPrint(lastMessage);
+  console.log("-----\n");
+}
+
+for await (const step of await graphWithMemory.stream(inputs4, threadConfig)) {
   const lastMessage = step.messages[step.messages.length - 1];
   prettyPrint(lastMessage);
   console.log("-----\n");
