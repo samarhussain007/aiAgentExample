@@ -2,9 +2,7 @@ import { CheerioWebBaseLoader } from "@langchain/community/document_loaders/web/
 import { ChatOllama, OllamaEmbeddings } from "@langchain/ollama";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { MemoryVectorStore } from "langchain/vectorstores/memory";
-
 import { toolsCondition } from "@langchain/langgraph/prebuilt";
-
 import {
   AIMessage,
   HumanMessage,
@@ -19,17 +17,15 @@ import {
 } from "@langchain/langgraph";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { z } from "zod";
-
 import { BaseMessage, isAIMessage } from "@langchain/core/messages";
-import { threadId } from "worker_threads";
+import { createReactAgent } from "@langchain/langgraph/prebuilt";
 
 const model = new ChatOllama({
-  model: "mistral",
-  temperature: 0.3,
+  model: "llama3.2",
 });
 
 const embeddings = new OllamaEmbeddings({
-  model: "mistral",
+  model: "llama3.2",
 });
 
 const vectorStore = new MemoryVectorStore(embeddings);
@@ -58,7 +54,20 @@ const retrieveSchema = z.object({ query: z.string() });
 // Define application steps
 const retrieve = tool(
   async ({ query }) => {
-    const retrievedDocs = await vectorStore.similaritySearch(query, 2);
+    const reformulatedQuery = await model.invoke([
+      new SystemMessage(
+        "Rephrase the following into a technical research-style query about agent architectures in LLMs."
+      ),
+      new HumanMessage(query),
+    ]);
+
+    const retrievedDocs = await vectorStore.similaritySearch(
+      typeof reformulatedQuery.content === "string"
+        ? reformulatedQuery.content
+        : query,
+      5
+    );
+
     const serialized = retrievedDocs.map(
       (el) => `Source ${el.metadata.source}\nContent: ${el.pageContent}`
     );
@@ -105,11 +114,12 @@ const generate = async (state: typeof MessagesAnnotation.State) => {
 
   const systemMessageContent =
     "You are an assistant for question-answering tasks. " +
-    "Use the following pieces of retrieved context to answer " +
-    "the question. If you don't know the answer, say that you " +
-    "don't know. Use three sentences maximum and keep the " +
-    "answer concise." +
+    "When the user asks a multi-step question, break it into clear parts and handle each in sequence. " +
+    "Use the retrieved context below to answer each part directly. " +
+    "If any part cannot be answered, say that you don't know. " +
+    "Limit your response to three clear and concise sentences for each part." +
     "\n\n" +
+    "Retrieved context:\n" +
     `${docsContent}`;
 
   const conversationMessages = state.messages.filter(
@@ -163,43 +173,19 @@ const prettyPrint = (message: BaseMessage) => {
   console.log(txt);
 };
 
-let inputs1 = {
-  messages: [
-    new SystemMessage(
-      "You are a helpful assistant. If the user greets you (e.g., says 'hello', 'hi', 'hey'), respond with a short, friendly greeting. Do not suggest tools or offer examples unless the user asks a specific question."
-    ),
-    new HumanMessage("Hello"),
-  ],
-};
+const agent = createReactAgent({
+  llm: model,
+  tools: [retrieve],
+});
 
-let inputs2 = {
-  messages: [
-    new SystemMessage(`
-You are a helpful assistant. When the user asks a technical question, respond by calling the \`retrieve\` tool using the structured tool call system, not as plain text.
+let inputMessage = `What is the standard method for Task Decomposition?
+Once you get the answer, look up common extensions of that method.`;
 
-Example tool call (do this, not just write it):
-retrieve({ "query": "Common methods of self-reflection in autonomous agents" })
+let inputs5 = { messages: [{ role: "user", content: inputMessage }] };
 
-Do not describe the tool. Just invoke it when needed.
-`),
-
-    new HumanMessage("How does the Self-Reflective agent architecture work?"),
-  ],
-};
-
-let inputs4 = {
-  messages: [
-    { role: "user", content: "Can you look up some common ways of doing it?" },
-  ],
-};
-
-for await (const step of await graphWithMemory.stream(inputs2, threadConfig)) {
-  const lastMessage = step.messages[step.messages.length - 1];
-  prettyPrint(lastMessage);
-  console.log("-----\n");
-}
-
-for await (const step of await graphWithMemory.stream(inputs4, threadConfig)) {
+for await (const step of await agent.stream(inputs5, {
+  streamMode: "values",
+})) {
   const lastMessage = step.messages[step.messages.length - 1];
   prettyPrint(lastMessage);
   console.log("-----\n");
