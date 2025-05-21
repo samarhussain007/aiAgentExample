@@ -38,6 +38,7 @@
     "@langchain/google-genai": "^0.2.9",
     "@langchain/langgraph": "^0.2.71",
     "@langchain/ollama": "^0.2.0",
+    "@tavily/core": "^0.5.2",
     "@types/node": "^18.14.6",
     "cheerio": "^1.0.0",
     "cors": "^2.8.5",
