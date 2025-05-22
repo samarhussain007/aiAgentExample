@@ -1,328 +1,360 @@
-import "dotenv/config";
-import { tavily } from "@tavily/core";
-import { tool } from "@langchain/core/tools";
+import dotenv from "dotenv";
+dotenv.config();
+
+import { CheerioWebBaseLoader } from "@langchain/community/document_loaders/web/cheerio";
+import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
+import { MemoryVectorStore } from "langchain/vectorstores/memory";
+import { createRetrieverTool } from "langchain/tools/retriever";
+import { ToolNode } from "@langchain/langgraph/prebuilt";
+import { pull } from "langchain/hub";
+import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
+import { GoogleGenerativeAIEmbeddings } from "@langchain/google-genai";
+
+import { Annotation, END, Graph, START } from "@langchain/langgraph";
+import { AIMessage, BaseMessage, HumanMessage } from "@langchain/core/messages";
 import { z } from "zod";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+
+import { StateGraph } from "@langchain/langgraph";
+import { TaskType } from "@google/generative-ai";
+
 import { ChatOllama } from "@langchain/ollama";
-import {
-  Annotation,
-  MemorySaver,
-  MessagesAnnotation,
-  NodeInterrupt,
-  StateGraph,
-} from "@langchain/langgraph";
-import { createReactAgent } from "@langchain/langgraph/prebuilt";
-import { AIMessage, HumanMessage } from "@langchain/core/messages";
-import { zodToJsonSchema } from "zod-to-json-schema";
 
-const model = new ChatOllama({
-  model: "llama3.1:8b",
-  temperature: 0,
-});
+const urls = [
+  "https://lilianweng.github.io/posts/2023-06-23-agent/",
+  "https://lilianweng.github.io/posts/2023-03-15-prompt-engineering/",
+  "https://lilianweng.github.io/posts/2023-10-25-adv-attack-llm/",
+];
 
-const StateAnnotation = Annotation.Root({
-  ...MessagesAnnotation.spec,
-  nextRepresentative: Annotation<string>,
-  refundAuthorized: Annotation<boolean>,
-});
-
-const initialSupport = async (state: typeof StateAnnotation.State) => {
-  const SYSTEM_TEMPLATE = `You are frontline support staff for LangCorp, a company that sells computers.
-Be concise in your responses.
-You can chat with customers and help them with basic questions, but if the customer is having a billing or technical problem,
-do not try to answer the question directly or gather information.
-Instead, immediately transfer them to the billing or technical team by asking the user to hold for a moment.
-Otherwise, just respond conversationally. NOTE: Dont try to answer technical or billing related queries directly or gather information from user`;
-
-  const supportResponse = await model.invoke([
-    { role: "system", content: SYSTEM_TEMPLATE },
-    ...state.messages,
-  ]);
-
-  const CATEGORIZATION_SYSTEM_TEMPLATE = `You are an expert customer support routing system.
-Your job is to detect whether a customer support representative is routing a user to a billing team or a technical team, or if they are just responding conversationally.`;
-  const CATEGORIZATION_HUMAN_TEMPLATE = `The previous conversation is an interaction between a customer support representative and a user.
-Extract whether the representative is routing the user to a billing or technical team, or whether they are just responding conversationally.
-Respond with a JSON object containing a single key called "nextRepresentative" with one of the following values:
-
-If they want to route the user to the billing team, respond only with the word "BILLING".
-If they want to route the user to the technical team, respond only with the word "TECHNICAL".
-Otherwise, respond only with the word "RESPOND".`;
-
-  const categorizationResponse = await model.invoke(
-    [
-      { role: "system", content: CATEGORIZATION_SYSTEM_TEMPLATE },
-      ...state.messages,
-      {
-        role: "user",
-        content: CATEGORIZATION_HUMAN_TEMPLATE,
-      },
-    ],
-    {
-      format: zodToJsonSchema(
-        z.object({
-          nextRepresentative: z.enum(["BILLING", "TECHNICAL", "RESPOND"]),
-        })
-      ),
-    }
-  );
-
-  const categorizationOutput = JSON.parse(
-    categorizationResponse.content as string
-  );
-  return {
-    messages: [supportResponse],
-    nextRepresentative: categorizationOutput.nextRepresentative,
-    refundAuthorized: false,
-  };
-};
-
-const billingSupport = async (state: typeof StateAnnotation.State) => {
-  const SYSTEM_TEMPLATE = `You are an expert billing support specialist for LangCorp, a company that sells computers.
-Help the user to the best of your ability, but be concise in your responses.
-You have the ability to authorize refunds, which you can do by transferring the user to another agent who will collect the required information.
-If you do, assume the other agent has all necessary information about the customer and their order.
-You do not need to ask the user for more information.
-
-Help the user to the best of your ability, but be concise in your responses.`;
-
-  let trimmedHistory = state.messages;
-
-  if (trimmedHistory.at(-1)?.getType() === "ai") {
-    trimmedHistory = trimmedHistory.slice(0, 1);
-  }
-
-  const billingRepResponse = await model.invoke([
-    { role: "system", content: SYSTEM_TEMPLATE },
-    ...trimmedHistory,
-  ]);
-
-  const CATEGORIZATION_SYSTEM_TEMPLATE = `Your job is to detect whether a billing support representative wants to refund the user.`;
-
-  const CATEGORIZATION_HUMAN_TEMPLATE = `The following text is a response from a customer support representative.
-Extract whether they want to refund the user or not.
-Respond with a JSON object containing a single key called "nextRepresentative" with one of the following values:
-
-If they want to refund the user, respond only with the word "REFUND".
-Otherwise, respond only with the word "RESPOND".
-
-Here is the text:
-
-<text>
-${billingRepResponse.content}
-</text>.`;
-
-  const categorizationResponse = await model.invoke(
-    [
-      {
-        role: "system",
-        content: CATEGORIZATION_SYSTEM_TEMPLATE,
-      },
-
-      {
-        role: "user",
-        content: CATEGORIZATION_HUMAN_TEMPLATE,
-      },
-    ],
-    {
-      format: zodToJsonSchema(
-        z.object({
-          nextRepresentative: z.enum(["REFUND", "RESPOND"]),
-        })
-      ),
-    }
-  );
-
-  const categorizationOutput = JSON.parse(
-    categorizationResponse.content as string
-  );
-
-  return {
-    messages: [billingRepResponse],
-    nextRepresentative: categorizationOutput.nextRepresentative,
-    // refundAuthorized: categorizationOutput.nextRepresentative === "REFUND",
-  };
-};
-
-const technicalSupport = async (state: typeof StateAnnotation.State) => {
-  const SYSTEM_TEMPLATE = `You are an expert at diagnosing technical computer issues. You work for a company called LangCorp that sells computers.
-Help the user to the best of your ability, but be concise in your responses. Start the conversation with a formal greeting and introduce on what you do and then get on with solving the problem`;
-
-  let trimmedHistory = state.messages;
-  // Make the user's question the most recent message in the history.
-  // This helps small models stay focused.
-  if (trimmedHistory.at(-1)?.getType() === "ai") {
-    trimmedHistory = trimmedHistory.slice(0, -1);
-  }
-
-  const response = await model.invoke([
-    {
-      role: "system",
-      content: SYSTEM_TEMPLATE,
-    },
-    ...trimmedHistory,
-  ]);
-
-  return {
-    messages: response,
-  };
-};
-
-const handleRefund = async (state: typeof StateAnnotation.State) => {
-  if (!state.refundAuthorized) {
-    console.log("--- HUMAN AUTHORIZATION REQUIRED ---");
-    throw new NodeInterrupt("Human authorization required");
-  }
-  return {
-    messages: {
-      role: "assistant",
-      content: "Refund Processed!",
-    },
-  };
-};
-
-let builder = new StateGraph(StateAnnotation)
-  .addNode("initial_support", initialSupport)
-  .addNode("billing_support", billingSupport)
-  .addNode("technical_support", technicalSupport)
-  .addNode("handle_refund", handleRefund)
-  .addEdge("__start__", "initial_support");
-
-builder = builder.addConditionalEdges(
-  "initial_support",
-  async (state: typeof StateAnnotation.State) => {
-    if (state.nextRepresentative.includes("BILLING")) {
-      return "billing";
-    } else if (state.nextRepresentative.includes("TECHNICAL")) {
-      return "technical";
-    } else {
-      return "conversational";
-    }
-  },
-  {
-    billing: "billing_support",
-    technical: "technical_support",
-    conversational: "__end__",
-  }
+const docs = await Promise.all(
+  urls.map(async (url) => {
+    const loader = new CheerioWebBaseLoader(url, {
+      selector: ".post-content",
+    });
+    const docs = await loader.load();
+    return docs;
+  })
 );
 
-console.log("Added edges!");
+const docsList = docs.flat();
 
-builder = builder.addEdge("technical_support", "__end__").addConditionalEdges(
-  "billing_support",
-  async (state) => {
-    if (state.nextRepresentative.includes("REFUND")) {
-      return "refund";
-    } else {
-      return "__end__";
-    }
-  },
-  {
-    refund: "handle_refund",
-    __end__: "__end__",
-  }
-);
-
-console.log("Added edges!");
-
-const checkpointer = new MemorySaver();
-
-const graph = builder.compile({
-  checkpointer,
+const textsplitters = new RecursiveCharacterTextSplitter({
+  chunkSize: 500,
+  chunkOverlap: 50,
 });
 
-// const stream = await graph.stream(
-//   {
-//     messages: [
-//       {
-//         role: "user",
-//         content: "I've changed my mind and I want a refund for order #182818!",
-//       },
-//     ],
-//   },
-//   {
-//     configurable: {
-//       thread_id: "refund_testing_id",
-//     },
-//   }
-// );
+const docsSplit = await textsplitters.splitDocuments(docsList);
 
-// for await (const value of stream) {
-//   // Get the dynamic key (assuming only one key exists at top level)
-//   const dynamicKey = Object.keys(value)[0];
-//   if (!dynamicKey) {
-//     console.log("No keys found in chunk");
-//     continue;
-//   }
-
-//   // Safely get the message content
-//   const message = value[dynamicKey]?.messages?.[0]?.content;
-
-//   if (message) {
-//     console.log(message);
-//   } else {
-//     console.log("No message found in this chunk");
-//   }
-// }
-
-// const currentState = await graph.getState({
-//   configurable: { thread_id: "refund_testing_id" },
-// });
-
-// // console.log("CURRENT TASKS", JSON.stringify(currentState.tasks, null, 2));
-// // console.log("NEXT TASKS", currentState.next);
-
-// // console.log("GETTING HUMAN AUTHORIZATION WAIT FOR A MINUTE");
-// await graph.updateState(
-//   { configurable: { thread_id: "refund_testing_id" } },
-//   {
-//     refundAuthorized: true,
-//   }
-// );
-
-// const resumedStream = await graph.stream(null, {
-//   configurable: { thread_id: "refund_testing_id" },
-// });
-// for await (const value of resumedStream) {
-//   console.log(value);
-// }
-
-// const technicalStream = await graph.stream(
-//   {
-//     messages: [
-//       {
-//         role: "user",
-//         content:
-//           "My LangCorp computer isn't turning on because I dropped it in water.",
-//       },
-//     ],
-//   },
-//   {
-//     configurable: {
-//       thread_id: "technical_testing_id",
-//     },
-//   }
-// );
-
-// for await (const value of technicalStream) {
-//   console.log(value);
-// }
-
-const conversationalStream = await graph.stream(
-  {
-    messages: [
-      {
-        role: "user",
-        content: "How are you? I'm Cobb.",
-      },
-    ],
-  },
-  {
-    configurable: {
-      thread_id: "conversational_testing_id",
-    },
-  }
+const vectoreStore = await MemoryVectorStore.fromDocuments(
+  docsSplit,
+  new GoogleGenerativeAIEmbeddings({
+    model: "gemini-embedding-exp-03-07",
+    taskType: TaskType.SEMANTIC_SIMILARITY,
+    apiKey: process.env.GOOGLE_API_KEY,
+  })
 );
 
-for await (const value of conversationalStream) {
-  console.log(value);
+const retriever = vectoreStore.asRetriever();
+
+// Creating a tool for retriever
+const retrieverTool = createRetrieverTool(retriever, {
+  name: "retrieve_blog_posts",
+  description:
+    "Search and return information about Lilian Weng blog posts on LLM agents, prompt engineering, and adversarial attacks on LLMs.",
+});
+
+const tools = [retrieverTool];
+const toolNode = new ToolNode<typeof GraphState.State>(tools);
+
+const GraphState = Annotation.Root({
+  messages: Annotation<BaseMessage[]>({
+    reducer: (x, y) => x.concat(y),
+    default: () => [],
+  }),
+});
+
+//functions
+
+/**
+ * Decides whether the agent should retrieve more information or end the process.
+ * This function checks the last message in the state for a function call. If a tool call is
+ * present, the process continues to retrieve information. Otherwise, it ends the process.
+ * @param {typeof GraphState.State} state - The current state of the agent, including all messages.
+ * @returns {string} - A decision to either "continue" the retrieval process or "end" it.
+ */
+
+function shouldRetrieve(state: typeof GraphState.State): string {
+  const { messages } = state;
+  console.log("---DECIDE TO RETRIEVE---");
+  const lastMessage = messages[messages.length - 1];
+
+  if (
+    "tool_calls" in lastMessage &&
+    Array.isArray(lastMessage.tool_calls) &&
+    lastMessage.tool_calls.length
+  ) {
+    console.log("---DECISION: RETRIEVE---");
+    return "retrieve";
+  }
+  // If there are no tool calls then we finish.
+  return END;
 }
+
+/**
+ * Determines whether the Agent should continue based on the relevance of retrieved documents.
+ * This function checks if the last message in the conversation is of type FunctionMessage, indicating
+ * that document retrieval has been performed. It then evaluates the relevance of these documents to the user's
+ * initial question using a predefined model and output parser. If the documents are relevant, the conversation
+ * is considered complete. Otherwise, the retrieval process is continued.
+ * @param {typeof GraphState.State} state - The current state of the agent, including all messages.
+ * @returns {Promise<Partial<typeof GraphState.State>>} - The updated state with the new message added to the list of messages.
+ */
+
+async function gradeDocuments(
+  state: typeof GraphState.State
+): Promise<Partial<typeof GraphState.State>> {
+  console.log("---GET RELEVANCE---");
+  const { messages } = state;
+  const tool = {
+    name: "give_relevance_score",
+    description: "Give a relevance score to the retrieved documents.",
+    schema: z.object({
+      binaryScore: z.string().describe("Relevance score 'yes' or 'no'"),
+    }),
+  };
+
+  const prompt = ChatPromptTemplate.fromTemplate(
+    `You are a grader assessing relevance of retrieved docs to a user question.
+  Here are the retrieved docs:
+  \n ------- \n
+  {context} 
+  \n ------- \n
+  Here is the user question: {question}
+  If the content of the docs are relevant to the users question, score them as relevant.
+  Give a binary score 'yes' or 'no' score to indicate whether the docs are relevant to the question.
+  Yes: The docs are relevant to the question.
+  No: The docs are not relevant to the question.`
+  );
+
+  const model = new ChatGoogleGenerativeAI({
+    model: "gemini-2.0-flash",
+    temperature: 0,
+    apiKey: process.env.GOOGLE_API_KEY,
+  }).bindTools([tool], {
+    tool_choice: tool.name,
+  });
+
+  const chain = prompt.pipe(model);
+
+  const lastMessage = messages[messages.length - 1];
+
+  const score = await chain.invoke({
+    question: messages[0].content as string,
+    context: lastMessage.content,
+  });
+
+  console.log("---SCORE---");
+  console.log(score);
+
+  return {
+    messages: [score],
+  };
+}
+
+/**
+ * Check the relevance of the previous LLM tool call.
+ *
+ * @param {typeof GraphState.State} state - The current state of the agent, including all messages.
+ * @returns {string} - A directive to either "yes" or "no" based on the relevance of the documents.
+ */
+
+function checkRelevance(state: typeof GraphState.State): string {
+  console.log("---CHECK RELEVANCE---");
+
+  const { messages } = state;
+  const lastMessage = messages[messages.length - 1];
+  if (!("tool_calls" in lastMessage)) {
+    throw new Error(
+      "The 'checkRelevance' node requires the most recent message to contain tool calls."
+    );
+  }
+  const toolCalls = (lastMessage as AIMessage).tool_calls;
+  if (!toolCalls || !toolCalls.length) {
+    throw new Error("Last message was not a function message");
+  }
+
+  if (toolCalls[0].args.binaryScore === "yes") {
+    console.log("---DECISION: DOCS RELEVANT---");
+    return "yes";
+  }
+  console.log("---DECISION: DOCS NOT RELEVANT---");
+  return "no";
+}
+
+// Nodes
+
+/**
+ * Invokes the agent model to generate a response based on the current state.
+ * This function calls the agent model to generate a response to the current conversation state.
+ * The response is added to the state's messages.
+ * @param {typeof GraphState.State} state - The current state of the agent, including all messages.
+ * @returns {Promise<Partial<typeof GraphState.State>>} - The updated state with the new message added to the list of messages.
+ */
+
+async function agent(
+  state: typeof GraphState.State
+): Promise<Partial<typeof GraphState.State>> {
+  console.log("---CALL AGENT---");
+  const { messages } = state;
+
+  // Find the AIMessage which contains the `give_relevance_score` tool call,
+  // and remove it if it exists. This is because the agent does not need to know
+  // the relevance score.
+
+  const filteredMessages = messages.filter(
+    (message) =>
+      !(
+        message instanceof AIMessage &&
+        message.tool_calls &&
+        message.tool_calls[0].name === "give_relevance_score"
+      )
+  );
+
+  const model = new ChatGoogleGenerativeAI({
+    model: "gemini-2.0-flash",
+    temperature: 0,
+    apiKey: process.env.GOOGLE_API_KEY,
+    streaming: true,
+  }).bindTools(tools);
+
+  const response = await model.invoke(filteredMessages);
+
+  return {
+    messages: [response],
+  };
+}
+
+/**
+ * Transform the query to produce a better question.
+ * @param {typeof GraphState.State} state - The current state of the agent, including all messages.
+ * @returns {Promise<Partial<typeof GraphState.State>>} - The updated state with the new message added to the list of messages.
+ */
+
+async function rewrite(
+  state: typeof GraphState.State
+): Promise<Partial<typeof GraphState.State>> {
+  console.log("REWRITE QUERY");
+  const { messages } = state;
+  const question = messages[0].content as string;
+  const prompt = ChatPromptTemplate.fromTemplate(
+    `Look at the input and try to reason about the underlying semantic intent / meaning. \n 
+Here is the initial question:
+\n ------- \n
+{question} 
+\n ------- \n
+Formulate an improved question:`
+  );
+
+  const model = new ChatGoogleGenerativeAI({
+    model: "gemini-2.0-flash",
+    temperature: 0,
+    apiKey: process.env.GOOGLE_API_KEY,
+  });
+
+  const chain = prompt.pipe(model);
+
+  const response = await chain.invoke({ question });
+  return {
+    messages: [response],
+  };
+}
+
+/**
+ * Generate answer
+ * @param {typeof GraphState.State} state - The current state of the agent, including all messages.
+ * @returns {Promise<Partial<typeof GraphState.State>>} - The updated state with the new message added to the list of messages.
+ */
+
+async function generate(
+  state: typeof GraphState.State
+): Promise<Partial<typeof GraphState.State>> {
+  console.log("---GENERATE ANSWER---");
+  const { messages } = state;
+  const question = messages[0].content as string;
+  const lastToolMessage = messages
+    .slice()
+    .reverse()
+    .find((message) => message.getType() === "tool");
+
+  const prompt = await pull<ChatPromptTemplate>("rlm/rag-prompt");
+
+  const model = new ChatGoogleGenerativeAI({
+    model: "gemini-2.0-flash",
+    temperature: 0,
+    apiKey: process.env.GOOGLE_API_KEY,
+    streaming: true,
+  }).bindTools(tools);
+
+  const chain = prompt.pipe(model);
+
+  const response = await chain.invoke({
+    question,
+    context: lastToolMessage?.content,
+  });
+
+  return {
+    messages: [response],
+  };
+}
+
+// Define the graph
+const workflow = new StateGraph(GraphState)
+  // Define the nodes which we'll cycle between.
+  .addNode("agent", agent)
+  .addNode("retrieve", toolNode)
+  .addNode("gradeDocuments", gradeDocuments)
+  .addNode("rewrite", rewrite)
+  .addNode("generate", generate);
+
+workflow.addEdge(START, "agent").addConditionalEdges("agent", shouldRetrieve);
+
+workflow.addEdge("retrieve", "gradeDocuments");
+
+workflow.addConditionalEdges("gradeDocuments", checkRelevance, {
+  yes: "generate",
+  no: "rewrite",
+});
+workflow.addEdge("rewrite", "agent");
+
+workflow.addEdge("generate", END);
+
+const app = workflow.compile();
+
+const inputs = {
+  messages: [
+    new HumanMessage(
+      "What are the types of agent memory based on Lilian Weng's blog post?"
+    ),
+  ],
+};
+
+let finalState;
+
+for await (const output of await app.stream(inputs)) {
+  for (const [key, value] of Object.entries(output)) {
+    const lastMsg = output[key].messages[output[key].messages.length - 1];
+    console.log(`Output from node: '${key}'`);
+    console.dir(
+      {
+        type: lastMsg.getType(),
+        content: lastMsg.content,
+        tool_calls: lastMsg.tool_calls,
+      },
+      { depth: null }
+    );
+    console.log("---\n");
+    finalState = value;
+  }
+}
+
+console.log(JSON.stringify(finalState, null, 2));
