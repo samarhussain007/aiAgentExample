@@ -4,26 +4,20 @@ dotenv.config();
 import { CheerioWebBaseLoader } from "@langchain/community/document_loaders/web/cheerio";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { tavily } from "@tavily/core";
-import { MemoryVectorStore } from "langchain/vectorstores/memory";
-import { createRetrieverTool } from "langchain/tools/retriever";
-import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { pull } from "langchain/hub";
-import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
-import { GoogleGenerativeAIEmbeddings } from "@langchain/google-genai";
+import { MemoryVectorStore } from "langchain/vectorstores/memory";
 
-import { Annotation, END, Graph, START } from "@langchain/langgraph";
-import { AIMessage, BaseMessage, HumanMessage } from "@langchain/core/messages";
-import { z } from "zod";
-import { ChatPromptTemplate } from "@langchain/core/prompts";
 import { StringOutputParser } from "@langchain/core/output_parsers";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { Annotation, END, START } from "@langchain/langgraph";
 import { formatDocumentsAsString } from "langchain/util/document";
+import { z } from "zod";
 
 import { StateGraph } from "@langchain/langgraph";
-import { TaskType } from "@google/generative-ai";
 
-import { ChatOllama, OllamaEmbeddings } from "@langchain/ollama";
 import { Document, DocumentInterface } from "@langchain/core/documents";
 import { tool } from "@langchain/core/tools";
+import { ChatOllama, OllamaEmbeddings } from "@langchain/ollama";
 
 const urls = [
   "https://lilianweng.github.io/posts/2023-06-23-agent/",
@@ -39,7 +33,7 @@ const model = new ChatOllama({
 const docs = await Promise.all(
   urls.map(async (url) => {
     const loader = new CheerioWebBaseLoader(url, {
-      selector: ".post-content",
+      selector: ".post-content, .article-body, article",
     });
     const docs = await loader.load();
     return docs;
@@ -48,17 +42,17 @@ const docs = await Promise.all(
 
 const allDocs = docs.flat();
 
-const textsplitters = new RecursiveCharacterTextSplitter({
-  chunkSize: 1000,
-  chunkOverlap: 200,
+const textSplitter = new RecursiveCharacterTextSplitter({
+  chunkSize: 500,
+  chunkOverlap: 250,
 });
 
-const docsSplit = await textsplitters.splitDocuments(allDocs);
+const docsSplit = await textSplitter.splitDocuments(allDocs);
 
 const vectorStore = await MemoryVectorStore.fromDocuments(
   docsSplit,
   new OllamaEmbeddings({
-    model: "llama3.1:8b",
+    model: "nomic-embed-text",
   })
 );
 
@@ -68,10 +62,20 @@ const GraphState = Annotation.Root({
   documents: Annotation<DocumentInterface[]>({
     reducer: (x, y) => y ?? x ?? [],
   }),
+
   question: Annotation<string>({
     reducer: (x, y) => y ?? x ?? "",
   }),
+
   generation: Annotation<string>({
+    reducer: (x, y) => y ?? x,
+  }),
+
+  generationVQuestionGrade: Annotation<string>({
+    reducer: (x, y) => y ?? x,
+  }),
+
+  generationVDocumentsGrade: Annotation<string>({
     reducer: (x, y) => y ?? x,
   }),
 });
@@ -94,6 +98,8 @@ async function retrieve(
       runName: "FetchRelevantDocs",
     })
     .invoke(question);
+
+  console.log("Retrieved documents:", question);
   return {
     documents,
   };
@@ -114,6 +120,8 @@ async function generate(
     context: formatDocumentsAsString(documents),
     question: question,
   });
+
+  console.log("---GENERATED ANSWER---", generation);
 
   return {
     generation,
@@ -274,20 +282,161 @@ function decideToGenerate(state: typeof GraphState.State) {
   return "generate";
 }
 
-const workflow = new StateGraph(GraphState)
-  .addNode("retrieve", retrieve)
-  .addNode("transformQuery", transformQuery)
-  .addNode("webSearch", webSearch)
-  .addNode("gradeDocuments", gradeDocuments)
-  .addNode("generate", generate);
+/**
+ * Determines whether the generation is grounded in the document.
+ *
+ * @param {typeof GraphState.State} state The current state of the graph.
+ * @param {RunnableConfig | undefined} config The configuration object for tracing.
+ * @returns {Promise<Partial<typeof GraphState.State>>} The new state object.
+ */
 
-//Build the graph with edges and nodes
+async function generateGenerationVDocumentsGrade(
+  state: typeof GraphState.State
+): Promise<Partial<typeof GraphState.State>> {
+  console.log("---GENERATE GENERATION vs DOCUMENTS GRADE---");
+  //@ts-ignore
+  const llmWithTool = model.withStructuredOutput(
+    z
+      .object({
+        binaryScore: z
+          .enum(["yes", "no"])
+          .describe("Relevance score 'yes' or 'no'"),
+      })
+      .describe(
+        "Grade the relevance of the retrieved documents to the question. Either 'yes' or 'no'."
+      ),
+    {
+      name: "grade",
+    }
+  );
+
+  const prompt = ChatPromptTemplate.fromTemplate(
+    `You are a grader assessing whether an answer is grounded in / supported by a set of facts.
+  Here are the facts:
+  \n ------- \n
+  {documents} 
+  \n ------- \n
+  Here is the answer: {generation}
+  Give a binary score 'yes' or 'no' to indicate whether the answer is grounded in / supported by a set of facts.`
+  );
+
+  const chain = prompt.pipe(llmWithTool);
+  const score = await chain.invoke({
+    documents: formatDocumentsAsString(state.documents),
+    generation: state.generation,
+  });
+  return {
+    generationVDocumentsGrade: score.binaryScore,
+  };
+}
+
+function gradeGenerationVDocuments(state: typeof GraphState.State) {
+  console.log("---GRADE GENERATION vs DOCUMENTS---");
+
+  const grade = state.generationVDocumentsGrade;
+  if (grade === "yes") {
+    console.log("---DECISION: SUPPORTED, MOVE TO FINAL GRADE---");
+    return "supported";
+  }
+
+  console.log("---DECISION: NOT SUPPORTED, GENERATE AGAIN---");
+  return "not supported";
+}
+
+async function generateGenerationVQuestionGrade(
+  state: typeof GraphState.State
+): Promise<Partial<typeof GraphState.State>> {
+  console.log("---GENERATE GENERATION vs QUESTION GRADE---");
+  //@ts-ignore
+  const llmWithTool = model.withStructuredOutput(
+    z
+      .object({
+        binaryScore: z
+          .enum(["yes", "no"])
+          .describe("Relevance score 'yes' or 'no'"),
+      })
+      .describe(
+        "Grade the relevance of the retrieved documents to the question. Either 'yes' or 'no'."
+      ),
+    {
+      name: "grade",
+    }
+  );
+
+  const prompt = ChatPromptTemplate.fromTemplate(
+    `You are a grader assessing whether an answer is relevant to a user question.
+  Here is the user question:
+  \n ------- \n
+  {question} 
+  \n ------- \n
+  Here is the answer: {generation}
+  Give a binary score 'yes' or 'no' to indicate whether the answer is relevant to the user question.`
+  );
+
+  const chain = prompt.pipe(llmWithTool);
+  const score = await chain.invoke({
+    question: state.question,
+    generation: state.generation,
+  });
+  return {
+    generationVQuestionGrade: score.binaryScore,
+  };
+}
+
+function gradeGenerationVQuestion(state: typeof GraphState.State) {
+  console.log("---GRADE GENERATION vs QUESTION---");
+
+  const grade = state.generationVQuestionGrade;
+  if (grade === "yes") {
+    console.log("---DECISION: USEFUL---");
+    return "useful";
+  }
+
+  console.log("---DECISION: NOT USEFUL---");
+  return "not useful";
+}
+
+const workflow = new StateGraph(GraphState)
+  // Define the nodes
+  .addNode("retrieve", retrieve)
+  .addNode("gradeDocuments", gradeDocuments)
+  .addNode("generate", generate)
+  .addNode(
+    "generateGenerationVDocumentsGrade",
+    generateGenerationVDocumentsGrade
+  )
+  .addNode("transformQuery", transformQuery)
+  .addNode(
+    "generateGenerationVQuestionGrade",
+    generateGenerationVQuestionGrade
+  );
+
+// Build graph
 workflow.addEdge(START, "retrieve");
 workflow.addEdge("retrieve", "gradeDocuments");
-workflow.addConditionalEdges("gradeDocuments", decideToGenerate);
-workflow.addEdge("transformQuery", "webSearch");
-workflow.addEdge("webSearch", "generate");
-workflow.addEdge("generate", END);
+workflow.addConditionalEdges("gradeDocuments", decideToGenerate, {
+  transformQuery: "transformQuery",
+  generate: "generate",
+});
+workflow.addEdge("transformQuery", "retrieve");
+workflow.addEdge("generate", "generateGenerationVDocumentsGrade");
+workflow.addConditionalEdges(
+  "generateGenerationVDocumentsGrade",
+  gradeGenerationVDocuments,
+  {
+    supported: "generateGenerationVQuestionGrade",
+    "not supported": "generate",
+  }
+);
+
+workflow.addConditionalEdges(
+  "generateGenerationVQuestionGrade",
+  gradeGenerationVQuestion,
+  {
+    useful: END,
+    "not useful": "transformQuery",
+  }
+);
 
 // Compile
 const app = workflow.compile();
@@ -297,16 +446,22 @@ const inputs = {
 };
 const config = { recursionLimit: 50 };
 
-let finalGeneration;
-for await (const output of await app.stream(inputs, config)) {
-  for (const [key, value] of Object.entries(output)) {
-    console.log(`Node: '${key}'`);
-    // Optional: log full state at each node
-    // console.log(JSON.stringify(value, null, 2));
-    finalGeneration = value;
+const prettifyOutput = (output: Record<string, any>) => {
+  const key = Object.keys(output)[0];
+  const value = output[key];
+  console.log(`Node: '${key}'`);
+  if (key === "retrieve" && "documents" in value) {
+    console.log(`Retrieved ${value.documents.length} documents.`);
+  } else if (key === "gradeDocuments" && "documents" in value) {
+    console.log(
+      `Graded documents. Found ${value.documents.length} relevant document(s).`
+    );
+  } else {
+    console.dir(value, { depth: null });
   }
-  console.log("\n---\n");
-}
+};
 
-// Log the final generation.
-console.log(JSON.stringify(finalGeneration, null, 2));
+for await (const output of await app.stream(inputs, config)) {
+  prettifyOutput(output);
+  console.log("\n---ITERATION END---\n");
+}
