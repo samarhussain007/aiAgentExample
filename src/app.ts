@@ -3,6 +3,7 @@ dotenv.config();
 
 import { CheerioWebBaseLoader } from "@langchain/community/document_loaders/web/cheerio";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
+import { tavily } from "@tavily/tavily";
 import { MemoryVectorStore } from "langchain/vectorstores/memory";
 import { createRetrieverTool } from "langchain/tools/retriever";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
@@ -21,7 +22,7 @@ import { StateGraph } from "@langchain/langgraph";
 import { TaskType } from "@google/generative-ai";
 
 import { ChatOllama, OllamaEmbeddings } from "@langchain/ollama";
-import { DocumentInterface } from "@langchain/core/documents";
+import { Document, DocumentInterface } from "@langchain/core/documents";
 import { tool } from "@langchain/core/tools";
 
 const urls = [
@@ -216,10 +217,30 @@ async function webSearch(
 ): Promise<Partial<typeof GraphState.State>> {
   console.log("---WEB SEARCH---");
 
-  const tvlyTool = tool();
-  // const docs = await tool.invoke({ input: state.question });
-  // const webResults = new Document({ pageContent: docs });
-  // const newDocuments = state.documents.concat(webResults);
+  const tvly = tavily({ apiKey: process.env.TAVILY_API_KEY });
+  //@ts-ignore
+  const tavilySearchTool = tool(
+    async ({ query }: { query: string }) => {
+      const response = await tvly.search(query, {
+        maxResults: 3,
+        includeAnswer: true,
+      });
+
+      return response;
+    },
+    {
+      schema: z.object({
+        query: z.string(),
+      }),
+      name: "Tavily search tool",
+      description: "Use this tool to search information from the web.",
+    }
+  );
+  const docs = await tavilySearchTool.invoke({
+    query: state.question,
+  });
+  const webResults = new Document({ pageContent: docs });
+  const newDocuments = state.documents.concat(webResults);
 
   return {
     documents: newDocuments,
