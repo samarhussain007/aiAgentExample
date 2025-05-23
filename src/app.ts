@@ -3,7 +3,7 @@ dotenv.config();
 
 import { CheerioWebBaseLoader } from "@langchain/community/document_loaders/web/cheerio";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
-import { tavily } from "@tavily/tavily";
+import { tavily } from "@tavily/core";
 import { MemoryVectorStore } from "langchain/vectorstores/memory";
 import { createRetrieverTool } from "langchain/tools/retriever";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
@@ -193,12 +193,15 @@ async function transformQuery(state: typeof GraphState.State) {
   \n ------- \n
   {question} 
   \n ------- \n
-  Formulate an improved question: `
+  Formulate an improved question: 
+  NOTE: Just make sure to return the question without any other text or explanation.`
   );
 
   const chain = prompt.pipe(model).pipe(new StringOutputParser());
 
   const betterQuestion = await chain.invoke({ question: state.question });
+
+  console.log("---TRANSFORMED QUESTION---", betterQuestion);
 
   return {
     question: betterQuestion,
@@ -216,6 +219,8 @@ async function webSearch(
   state: typeof GraphState.State
 ): Promise<Partial<typeof GraphState.State>> {
   console.log("---WEB SEARCH---");
+
+  console.log(state.question);
 
   const tvly = tavily({ apiKey: process.env.TAVILY_API_KEY });
   //@ts-ignore
@@ -239,10 +244,69 @@ async function webSearch(
   const docs = await tavilySearchTool.invoke({
     query: state.question,
   });
-  const webResults = new Document({ pageContent: docs });
+  const webResults = new Document({ pageContent: docs?.answer || "" });
   const newDocuments = state.documents.concat(webResults);
 
   return {
     documents: newDocuments,
   };
 }
+
+/**
+ * Determines whether to generate an answer, or re-generate a question.
+ *
+ * @param {typeof GraphState.State} state The current state of the graph.
+ * @returns {"transformQuery" | "generate"} Next node to call
+ */
+function decideToGenerate(state: typeof GraphState.State) {
+  console.log("---DECIDE TO GENERATE---");
+
+  const filteredDocs = state.documents;
+  if (filteredDocs.length === 0) {
+    // All documents have been filtered checkRelevance
+    // We will re-generate a new query
+    console.log("---DECISION: TRANSFORM QUERY---");
+    return "transformQuery";
+  }
+
+  // We have relevant documents, so generate answer
+  console.log("---DECISION: GENERATE---");
+  return "generate";
+}
+
+const workflow = new StateGraph(GraphState)
+  .addNode("retrieve", retrieve)
+  .addNode("transformQuery", transformQuery)
+  .addNode("webSearch", webSearch)
+  .addNode("gradeDocuments", gradeDocuments)
+  .addNode("generate", generate);
+
+//Build the graph with edges and nodes
+workflow.addEdge(START, "retrieve");
+workflow.addEdge("retrieve", "gradeDocuments");
+workflow.addConditionalEdges("gradeDocuments", decideToGenerate);
+workflow.addEdge("transformQuery", "webSearch");
+workflow.addEdge("webSearch", "generate");
+workflow.addEdge("generate", END);
+
+// Compile
+const app = workflow.compile();
+
+const inputs = {
+  question: "Explain how the different types of agent memory work.",
+};
+const config = { recursionLimit: 50 };
+
+let finalGeneration;
+for await (const output of await app.stream(inputs, config)) {
+  for (const [key, value] of Object.entries(output)) {
+    console.log(`Node: '${key}'`);
+    // Optional: log full state at each node
+    // console.log(JSON.stringify(value, null, 2));
+    finalGeneration = value;
+  }
+  console.log("\n---\n");
+}
+
+// Log the final generation.
+console.log(JSON.stringify(finalGeneration, null, 2));
