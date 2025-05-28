@@ -8,460 +8,192 @@ import { pull } from "langchain/hub";
 import { MemoryVectorStore } from "langchain/vectorstores/memory";
 
 import { StringOutputParser } from "@langchain/core/output_parsers";
-import { ChatPromptTemplate } from "@langchain/core/prompts";
 import { Annotation, END, START } from "@langchain/langgraph";
 import { formatDocumentsAsString } from "langchain/util/document";
 import { z } from "zod";
 
 import { StateGraph } from "@langchain/langgraph";
+import * as d3 from "d3";
+import * as tslab from "tslab";
 
+import { select, selectAll } from "d3";
 import { Document, DocumentInterface } from "@langchain/core/documents";
 import { tool } from "@langchain/core/tools";
-import { ChatOllama, OllamaEmbeddings } from "@langchain/ollama";
-
-const urls = [
-  "https://lilianweng.github.io/posts/2023-06-23-agent/",
-  "https://lilianweng.github.io/posts/2023-03-15-prompt-engineering/",
-  "https://lilianweng.github.io/posts/2023-10-25-adv-attack-llm/",
-];
+import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
+import { createCanvas } from "canvas";
+import {
+  ChatPromptTemplate,
+  MessagesPlaceholder,
+} from "@langchain/core/prompts";
+import { StructuredTool } from "@langchain/core/tools";
+import { Runnable, RunnableConfig } from "@langchain/core/runnables";
+import { HumanMessage } from "@langchain/core/messages";
+import { BaseMessage } from "@langchain/core/messages";
 
 const model = new ChatOllama({
   model: "llama3.1:8b",
   temperature: 0,
 });
 
-const docs = await Promise.all(
-  urls.map(async (url) => {
-    const loader = new CheerioWebBaseLoader(url, {
-      selector: ".post-content, .article-body, article",
+async function createAgent({
+  llm,
+  tools,
+  systemMessage,
+}: {
+  llm: ChatOllama;
+  tools: StructuredTool[];
+  systemMessage: string;
+}) {
+  const toolNames = tools.map((tool) => tool.name).join(", ");
+  let prompt = ChatPromptTemplate.fromMessages([
+    [
+      "system",
+      "You are a helpful AI assistant, collaborating with other assistants." +
+        " Use the provided tools to progress towards answering the question." +
+        " If you are unable to fully answer, that's OK, another assistant with different tools " +
+        " will help where you left off. Execute what you can to make progress." +
+        " If you or any of the other assistants have the final answer or deliverable," +
+        " prefix your response with FINAL ANSWER so the team knows to stop." +
+        " You have access to the following tools: {tool_names}.\n{system_message}",
+    ],
+    new MessagesPlaceholder("messages"),
+  ]);
+
+  prompt = await prompt.partial({
+    tool_names: toolNames,
+    system_message: systemMessage,
+  });
+
+  return prompt.pipe(llm.bindTools(tools));
+}
+
+const AgentState = Annotation.Root({
+  messages: Annotation<BaseMessage[]>({
+    reducer: (x, y) => x.concat(y),
+  }),
+  sender: Annotation<string>({
+    reducer: (x, y) => y ?? x ?? "user",
+    default: () => "user",
+  }),
+});
+//@ts-ignore
+const chartTool = tool(
+  ({ data }: { data: { label: string; value: number }[] }) => {
+    const width = 500;
+    const height = 500;
+    const margin = { top: 20, right: 30, bottom: 30, left: 40 };
+
+    const canvas = createCanvas(width, height);
+    const ctx = canvas.getContext("2d");
+
+    const x = d3
+      .scaleBand()
+      .domain(data.map((d) => d.label))
+      .range([margin.left, width - margin.right])
+      .padding(0.1);
+
+    const y = d3
+      .scaleLinear()
+      .domain([0, d3.max(data, (d) => d.value) ?? 0])
+      .nice()
+      .range([height - margin.bottom, margin.top]);
+
+    const colorPalette = [
+      "#e6194B",
+      "#3cb44b",
+      "#ffe119",
+      "#4363d8",
+      "#f58231",
+      "#911eb4",
+      "#42d4f4",
+      "#f032e6",
+      "#bfef45",
+      "#fabebe",
+    ];
+
+    data.forEach((d, idx) => {
+      ctx.fillStyle = colorPalette[idx % colorPalette.length];
+      ctx.fillRect(
+        x(d.label) ?? 0,
+        y(d.value),
+        x.bandwidth(),
+        height - margin.bottom - y(d.value)
+      );
     });
-    const docs = await loader.load();
-    return docs;
-  })
-);
 
-const allDocs = docs.flat();
+    ctx.beginPath();
+    ctx.strokeStyle = "black";
+    ctx.moveTo(margin.left, height - margin.bottom);
+    ctx.lineTo(width - margin.right, height - margin.bottom);
+    ctx.stroke();
 
-const textSplitter = new RecursiveCharacterTextSplitter({
-  chunkSize: 500,
-  chunkOverlap: 250,
-});
-
-const docsSplit = await textSplitter.splitDocuments(allDocs);
-
-const vectorStore = await MemoryVectorStore.fromDocuments(
-  docsSplit,
-  new OllamaEmbeddings({
-    model: "nomic-embed-text",
-  })
-);
-
-const retriever = vectorStore.asRetriever();
-
-const GraphState = Annotation.Root({
-  documents: Annotation<DocumentInterface[]>({
-    reducer: (x, y) => y ?? x ?? [],
-  }),
-
-  question: Annotation<string>({
-    reducer: (x, y) => y ?? x ?? "",
-  }),
-
-  generation: Annotation<string>({
-    reducer: (x, y) => y ?? x,
-  }),
-
-  generationVQuestionGrade: Annotation<string>({
-    reducer: (x, y) => y ?? x,
-  }),
-
-  generationVDocumentsGrade: Annotation<string>({
-    reducer: (x, y) => y ?? x,
-  }),
-});
-
-/**
- * Retrieve documents
- *
- * @param {typeof GraphState.State} state The current state of the graph.
- * @param {RunnableConfig | undefined} config The configuration object for tracing.
- * @returns {Promise<Partial<typeof GraphState.State>>} The new state object.
- */
-
-async function retrieve(
-  state: typeof GraphState.State
-): Promise<Partial<typeof GraphState.State>> {
-  console.log("Retrieving documents...");
-  const { question } = state;
-  const documents = await retriever
-    .withConfig({
-      runName: "FetchRelevantDocs",
-    })
-    .invoke(question);
-
-  console.log("Retrieved documents:", question);
-  return {
-    documents,
-  };
-}
-
-async function generate(
-  state: typeof GraphState.State
-): Promise<Partial<typeof GraphState.State>> {
-  console.log("---GENERATE---");
-
-  const prompt = await pull<ChatPromptTemplate>("rlm/rag-prompt");
-
-  const { documents, question } = state;
-
-  const ragChain = prompt.pipe(model).pipe(new StringOutputParser());
-
-  const generation = await ragChain.invoke({
-    context: formatDocumentsAsString(documents),
-    question: question,
-  });
-
-  console.log("---GENERATED ANSWER---", generation);
-
-  return {
-    generation,
-  };
-}
-
-async function gradeDocuments(
-  state: typeof GraphState.State
-): Promise<Partial<typeof GraphState.State>> {
-  console.log("---CHECK RELEVANCE---");
-
-  const gradeSchema = z
-    .object({
-      binaryScore: z
-        .enum(["yes", "no"])
-        .describe("Relevance score 'yes' or 'no'"),
-    })
-    .describe(
-      "Grade the relevance of the retrieved documents to the question."
-    );
-
-  //@ts-ignore
-  const llmWithTool = model.withStructuredOutput(gradeSchema, {
-    name: "grade",
-  });
-
-  const prompt = ChatPromptTemplate.fromTemplate(
-    `You are a grader assessing relevance of a retrieved document to a user question.
-  Here is the retrieved document:
-
-  {context}
-
-  Here is the user question: {question}
-
-  If the document contains keyword(s) or semantic meaning related to the user question, grade it as relevant.
-  Give a binary score 'yes' or 'no' score to indicate whether the document is relevant to the question.`
-  );
-
-  // Chain
-  const chain = prompt.pipe(llmWithTool);
-
-  const filteredDocs: Array<DocumentInterface> = [];
-  for await (const doc of state.documents) {
-    const grade = await chain.invoke({
-      context: doc.pageContent,
-      question: state.question,
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    x.domain().forEach((d) => {
+      const xCoord = (x(d) ?? 0) + x.bandwidth() / 2;
+      ctx.fillText(d, xCoord, height - margin.bottom + 6);
     });
-    if (grade.binaryScore === "yes") {
-      console.log("---GRADE: DOCUMENT RELEVANT---");
-      filteredDocs.push(doc);
-    } else {
-      console.log("---GRADE: DOCUMENT NOT RELEVANT---");
-    }
+
+    ctx.beginPath();
+    ctx.moveTo(margin.left, height - margin.top);
+    ctx.lineTo(margin.left, height - margin.bottom);
+    ctx.stroke();
+
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    const ticks = y.ticks();
+    ticks.forEach((d) => {
+      const yCoord = y(d); // height - margin.bottom - y(d);
+      ctx.moveTo(margin.left, yCoord);
+      ctx.lineTo(margin.left - 6, yCoord);
+      ctx.stroke();
+      ctx.fillText(d.toString(), margin.left - 8, yCoord);
+    });
+    tslab.display.png(canvas.toBuffer());
+    return "Chart has been generated and displayed to the user!";
+  },
+  {
+    name: "generate_bar_chart",
+    description:
+      "Generates a bar chart from an array of data points using D3.js and displays it for the user.",
+    schema: z.object({
+      data: z
+        .object({
+          label: z.string(),
+          value: z.number(),
+        })
+        .array(),
+    }),
   }
+);
 
-  return {
-    documents: filteredDocs,
-  };
-}
-
-/**
- * Transform the query to produce a better question.
- *
- * @param {typeof GraphState.State} state The current state of the graph.
- * @param {RunnableConfig | undefined} config The configuration object for tracing.
- * @returns {Promise<Partial<typeof GraphState.State>>} The new state object.
- */
-
-async function transformQuery(state: typeof GraphState.State) {
-  console.log("---TRANSFORM QUERY---");
-
-  // Pull in the prompt
-  const prompt = ChatPromptTemplate.fromTemplate(
-    `You are generating a question that is well optimized for semantic search retrieval.
-  Look at the input and try to reason about the underlying sematic intent / meaning.
-  Here is the initial question:
-  \n ------- \n
-  {question} 
-  \n ------- \n
-  Formulate an improved question: 
-  NOTE: Just make sure to return the question without any other text or explanation.`
-  );
-
-  const chain = prompt.pipe(model).pipe(new StringOutputParser());
-
-  const betterQuestion = await chain.invoke({ question: state.question });
-
-  console.log("---TRANSFORMED QUESTION---", betterQuestion);
-
-  return {
-    question: betterQuestion,
-  };
-}
-
-/**
- * Web search based on the re-phrased question using Tavily API.
- *
- * @param {typeof GraphState.State} state The current state of the graph.
- * @param {RunnableConfig | undefined} config The configuration object for tracing.
- * @returns {Promise<Partial<typeof GraphState.State>>} The new state object.
- */
-async function webSearch(
-  state: typeof GraphState.State
-): Promise<Partial<typeof GraphState.State>> {
-  console.log("---WEB SEARCH---");
-
-  console.log(state.question);
-
-  const tvly = tavily({ apiKey: process.env.TAVILY_API_KEY });
-  //@ts-ignore
-  const tavilySearchTool = tool(
-    async ({ query }: { query: string }) => {
-      const response = await tvly.search(query, {
-        maxResults: 3,
-        includeAnswer: true,
-      });
-
-      return response;
-    },
-    {
-      schema: z.object({
-        query: z.string(),
-      }),
-      name: "Tavily search tool",
-      description: "Use this tool to search information from the web.",
-    }
-  );
-  const docs = await tavilySearchTool.invoke({
-    query: state.question,
-  });
-  const webResults = new Document({ pageContent: docs?.answer || "" });
-  const newDocuments = state.documents.concat(webResults);
-
-  return {
-    documents: newDocuments,
-  };
-}
-
-/**
- * Determines whether to generate an answer, or re-generate a question.
- *
- * @param {typeof GraphState.State} state The current state of the graph.
- * @returns {"transformQuery" | "generate"} Next node to call
- */
-function decideToGenerate(state: typeof GraphState.State) {
-  console.log("---DECIDE TO GENERATE---");
-
-  const filteredDocs = state.documents;
-  if (filteredDocs.length === 0) {
-    // All documents have been filtered checkRelevance
-    // We will re-generate a new query
-    console.log("---DECISION: TRANSFORM QUERY---");
-    return "transformQuery";
+async function runAgentNode(props: {
+  state: typeof AgentState.State;
+  agent: Runnable;
+  name: string;
+  config?: RunnableConfig;
+}) {
+  const { state, agent, name, config } = props;
+  let result = await agent.invoke(state, config);
+  if (!result?.tool_calls || result.tool_calls.length === 0) {
+    result = new HumanMessage({ ...result, name: name });
   }
-
-  // We have relevant documents, so generate answer
-  console.log("---DECISION: GENERATE---");
-  return "generate";
-}
-
-/**
- * Determines whether the generation is grounded in the document.
- *
- * @param {typeof GraphState.State} state The current state of the graph.
- * @param {RunnableConfig | undefined} config The configuration object for tracing.
- * @returns {Promise<Partial<typeof GraphState.State>>} The new state object.
- */
-
-async function generateGenerationVDocumentsGrade(
-  state: typeof GraphState.State
-): Promise<Partial<typeof GraphState.State>> {
-  console.log("---GENERATE GENERATION vs DOCUMENTS GRADE---");
-  //@ts-ignore
-  const llmWithTool = model.withStructuredOutput(
-    z
-      .object({
-        binaryScore: z
-          .enum(["yes", "no"])
-          .describe("Relevance score 'yes' or 'no'"),
-      })
-      .describe(
-        "Grade the relevance of the retrieved documents to the question. Either 'yes' or 'no'."
-      ),
-    {
-      name: "grade",
-    }
-  );
-
-  const prompt = ChatPromptTemplate.fromTemplate(
-    `You are a grader assessing whether an answer is grounded in / supported by a set of facts.
-  Here are the facts:
-  \n ------- \n
-  {documents} 
-  \n ------- \n
-  Here is the answer: {generation}
-  Give a binary score 'yes' or 'no' to indicate whether the answer is grounded in / supported by a set of facts.`
-  );
-
-  const chain = prompt.pipe(llmWithTool);
-  const score = await chain.invoke({
-    documents: formatDocumentsAsString(state.documents),
-    generation: state.generation,
-  });
   return {
-    generationVDocumentsGrade: score.binaryScore,
+    messages: [result],
+    sender: name,
   };
 }
 
-function gradeGenerationVDocuments(state: typeof GraphState.State) {
-  console.log("---GRADE GENERATION vs DOCUMENTS---");
-
-  const grade = state.generationVDocumentsGrade;
-  if (grade === "yes") {
-    console.log("---DECISION: SUPPORTED, MOVE TO FINAL GRADE---");
-    return "supported";
-  }
-
-  console.log("---DECISION: NOT SUPPORTED, GENERATE AGAIN---");
-  return "not supported";
-}
-
-async function generateGenerationVQuestionGrade(
-  state: typeof GraphState.State
-): Promise<Partial<typeof GraphState.State>> {
-  console.log("---GENERATE GENERATION vs QUESTION GRADE---");
-  //@ts-ignore
-  const llmWithTool = model.withStructuredOutput(
-    z
-      .object({
-        binaryScore: z
-          .enum(["yes", "no"])
-          .describe("Relevance score 'yes' or 'no'"),
-      })
-      .describe(
-        "Grade the relevance of the retrieved documents to the question. Either 'yes' or 'no'."
-      ),
-    {
-      name: "grade",
-    }
-  );
-
-  const prompt = ChatPromptTemplate.fromTemplate(
-    `You are a grader assessing whether an answer is relevant to a user question.
-  Here is the user question:
-  \n ------- \n
-  {question} 
-  \n ------- \n
-  Here is the answer: {generation}
-  Give a binary score 'yes' or 'no' to indicate whether the answer is relevant to the user question.`
-  );
-
-  const chain = prompt.pipe(llmWithTool);
-  const score = await chain.invoke({
-    question: state.question,
-    generation: state.generation,
-  });
-  return {
-    generationVQuestionGrade: score.binaryScore,
-  };
-}
-
-function gradeGenerationVQuestion(state: typeof GraphState.State) {
-  console.log("---GRADE GENERATION vs QUESTION---");
-
-  const grade = state.generationVQuestionGrade;
-  if (grade === "yes") {
-    console.log("---DECISION: USEFUL---");
-    return "useful";
-  }
-
-  console.log("---DECISION: NOT USEFUL---");
-  return "not useful";
-}
-
-const workflow = new StateGraph(GraphState)
-  // Define the nodes
-  .addNode("retrieve", retrieve)
-  .addNode("gradeDocuments", gradeDocuments)
-  .addNode("generate", generate)
-  .addNode(
-    "generateGenerationVDocumentsGrade",
-    generateGenerationVDocumentsGrade
-  )
-  .addNode("transformQuery", transformQuery)
-  .addNode(
-    "generateGenerationVQuestionGrade",
-    generateGenerationVQuestionGrade
-  );
-
-// Build graph
-workflow.addEdge(START, "retrieve");
-workflow.addEdge("retrieve", "gradeDocuments");
-workflow.addConditionalEdges("gradeDocuments", decideToGenerate, {
-  transformQuery: "transformQuery",
-  generate: "generate",
+const llm = new ChatGoogleGenerativeAI({
+  model: "gemini-2.0-flash",
+  apiKey: process.env.GOOGLE_API_KEY,
+  temperature: 0,
 });
-workflow.addEdge("transformQuery", "retrieve");
-workflow.addEdge("generate", "generateGenerationVDocumentsGrade");
-workflow.addConditionalEdges(
-  "generateGenerationVDocumentsGrade",
-  gradeGenerationVDocuments,
-  {
-    supported: "generateGenerationVQuestionGrade",
-    "not supported": "generate",
-  }
-);
 
-workflow.addConditionalEdges(
-  "generateGenerationVQuestionGrade",
-  gradeGenerationVQuestion,
-  {
-    useful: END,
-    "not useful": "transformQuery",
-  }
-);
-
-// Compile
-const app = workflow.compile();
-
-const inputs = {
-  question: "Explain how the different types of agent memory work.",
-};
-const config = { recursionLimit: 50 };
-
-const prettifyOutput = (output: Record<string, any>) => {
-  const key = Object.keys(output)[0];
-  const value = output[key];
-  console.log(`Node: '${key}'`);
-  if (key === "retrieve" && "documents" in value) {
-    console.log(`Retrieved ${value.documents.length} documents.`);
-  } else if (key === "gradeDocuments" && "documents" in value) {
-    console.log(
-      `Graded documents. Found ${value.documents.length} relevant document(s).`
-    );
-  } else {
-    console.dir(value, { depth: null });
-  }
-};
-
-for await (const output of await app.stream(inputs, config)) {
-  prettifyOutput(output);
-  console.log("\n---ITERATION END---\n");
-}
+// Research agent and node
+const researchAgent = await createAgent({
+  llm,
+  tools: [tavilyTool],
+  systemMessage:
+    "You should provide accurate data for the chart generator to use.",
+});
