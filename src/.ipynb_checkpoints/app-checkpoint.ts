@@ -81,7 +81,7 @@ const AgentState = Annotation.Root({
 //@ts-ignore
 const chartTool = tool(
   ({ data }: { data: { label: string; value: number }[] }) => {
-    console;
+    console.log("Generating bar chart with data:", data);
     const width = 500;
     const height = 500;
     const margin = { top: 20, right: 30, bottom: 30, left: 40 };
@@ -176,12 +176,9 @@ async function runAgentNode(props: {
   name: string;
   config?: RunnableConfig;
 }) {
-  console.log("reaches here:");
   const { state, agent, name, config } = props;
 
   let result = await agent.invoke(state, config);
-
-  console.log("Agent result:", result);
   if (!result?.tool_calls || result.tool_calls.length === 0) {
     result = new HumanMessage({ ...result, name: name });
   }
@@ -232,7 +229,8 @@ You are the Researcher in a multi-agent workflow whose sole job is to fetch and 
        "args": { "data": [ /* your array */ ] }
      }
    }
-4. After issuing the function call, stop. Wait for the chart agent to run the tool and render the chart.
+4. Do NOT add any commentary, analysis, or use the phrase “FINAL ANSWER”—that is the ChartGenerator’s role.
+5. After issuing the function call, stop. Wait for the chart agent to run the tool and render the chart.
 
 Follow these steps exactly for *any* charting task.
 `,
@@ -254,8 +252,7 @@ async function researchNode(
 const chartAgent = await createAgent({
   llm,
   tools: [chartTool],
-  systemMessage:
-    "Any charts you display will be visible by the user. Also end the workflow with FINAL ANSWER when you are done.",
+  systemMessage: "Any charts you display will be visible by the user.",
 });
 async function chartNode(state: typeof AgentState.State) {
   return runAgentNode({
@@ -269,9 +266,7 @@ const tools = [tavilySearchTool, chartTool];
 const toolNodes = new ToolNode<typeof AgentState.State>(tools);
 
 function router(state: typeof AgentState.State) {
-  console.log("Router state:", state);
   const messages = state.messages;
-  console.log("Router messages:", messages);
   const lastMessage = messages[messages.length - 1] as AIMessage;
 
   if (lastMessage?.tool_calls && lastMessage.tool_calls.length > 0) {
@@ -293,11 +288,8 @@ const workflow = new StateGraph(AgentState)
   .addNode("ChartGenerator", chartNode)
   .addNode("call_tool", toolNodes);
 
-// 3. Define the edges. We will define both regular and conditional ones
-// After a worker completes, report to supervisor
 workflow.addConditionalEdges("Researcher", router, {
-  // We will transition to the other agent
-  continue: "ChartGenerator",
+  continue: "Researcher",
   call_tool: "call_tool",
   end: END,
 });
@@ -308,6 +300,7 @@ workflow.addConditionalEdges("ChartGenerator", router, {
   call_tool: "call_tool",
   end: END,
 });
+
 workflow.addConditionalEdges("call_tool", (x) => x.sender, {
   ChartGenerator: "ChartGenerator",
   Researcher: "Researcher",
